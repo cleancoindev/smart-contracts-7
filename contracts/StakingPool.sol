@@ -7,24 +7,42 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 contract StakingPool is ERC20 {
 
   struct PoolBucket {
+    // slot 0
+    uint64 rewardPerSecondCut;
     uint96 unstakeRequested;
     uint96 unstaked;
-    uint64 rewardPerSecondCut;
+    // slot 1. find a way to pack this
+    uint96 unstakedNXM;
+    // uint160 _unused;
   }
 
   struct ProductBucket {
     uint96 capacityExpiring;
+    // uint160 _unused;
   }
 
   struct Product {
-    uint16 weight;
     uint96 usedCapacity;
+    uint16 weight;
     uint16 lastBucket;
+    // uint128 _unused;
     mapping(uint => ProductBucket) buckets;
   }
 
-  struct Staker {
+  struct UnstakeRequest {
+    uint96 amount;
+    uint96 withdrawn;
+    uint16 poolBucketIndex;
+    // uint48 _unused;
+  }
 
+  struct Staker {
+    uint96 pendingUnstakeAmount;
+    // unstakeRequests mapping keys. zero means no unstake exists.
+    uint32 firstUnstakeId;
+    uint32 lastUnstakeId;
+    uint16 lastUnstakeBucketIndex;
+    // uint48 _unused;
   }
 
   /* slot 0 */
@@ -32,24 +50,32 @@ contract StakingPool is ERC20 {
   mapping(uint => PoolBucket) public poolBuckets;
 
   /* slot 1 */
-  // note: will likely have to pack this
+  // staker address => staker unstake info
+  // todo: unstakes make take a looooong time, consider issuing an nft that represents staker's requests
+  mapping(address => Staker) public stakers;
+
+  /* slot 2 */
+  mapping(address => mapping(uint32 => UnstakeRequest)) unstakeRequests;
+
+  /* slot 3 */
   // product id => product info
   mapping(uint => Product) public products;
 
-  /* slot 2 */
+  /* slot 4 */
   // array with product ids to be able to iterate them
+  // todo: pack me
   uint[] public poolProductsIds;
 
-  /* slot 3 */
+  /* slot 5 */
   uint96 public currentStake;
   uint64 public currentRewardPerSecond;
   uint32 public lastRewardTime;
-  uint16 public lastPoolBucket;
-  uint16 public lastUnstakeBucket;
+  uint16 public lastPoolBucketIndex;
+  uint16 public lastUnstakeBucketIndex;
   uint16 public reservedStakeRatio;
   uint16 public _unused_01;
 
-  /* slot 4 */
+  /* slot 6 */
   uint96 public totalUnstakeRequested;
 
   /* immutables */
@@ -65,68 +91,57 @@ contract StakingPool is ERC20 {
     string memory _name,
     string memory _symbol
   ) ERC20(_name, _symbol) {
-    lastPoolBucket = uint16(block.timestamp / BUCKET_SIZE);
-    lastUnstakeBucket = uint16(block.timestamp / BUCKET_SIZE);
+    lastPoolBucketIndex = uint16(block.timestamp / BUCKET_SIZE);
+    lastUnstakeBucketIndex = uint16(block.timestamp / BUCKET_SIZE);
     nxm = ERC20(_nxm);
   }
 
   /* View functions */
 
-  function getAmountUnderManagement() internal view returns (uint) {
+  function readPoolBuckets() internal view returns (
+    uint staked,
+    uint rewardPerSecond,
+    uint rewardTime,
+    uint poolBucketIndex
+  ) {
 
     // all vars are in the same slot, uses 1 SLOAD
-    uint staked = currentStake;
-    uint rewardPerSecond = currentRewardPerSecond;
-    uint rewardTime = lastRewardTime;
-    uint poolBucket = lastPoolBucket;
+    staked = currentStake;
+    rewardPerSecond = currentRewardPerSecond;
+    rewardTime = lastRewardTime;
+    poolBucketIndex = lastPoolBucketIndex;
 
     // get bucket for current time
-    uint currentBucket = block.timestamp / BUCKET_SIZE;
+    uint currentBucketIndex = block.timestamp / BUCKET_SIZE;
 
-    while (poolBucket < currentBucket) {
+    while (poolBucketIndex < currentBucketIndex) {
 
-      ++poolBucket;
-      uint bucketStartTime = poolBucket * BUCKET_SIZE;
+      ++poolBucketIndex;
+      uint bucketStartTime = poolBucketIndex * BUCKET_SIZE;
       staked += (bucketStartTime - rewardTime) * rewardPerSecond;
 
       rewardTime = bucketStartTime;
-      rewardPerSecond -= poolBuckets[poolBucket].rewardPerSecondCut;
+      rewardPerSecond -= poolBuckets[poolBucketIndex].rewardPerSecondCut;
     }
 
     staked += (block.timestamp - rewardTime) * rewardPerSecond;
-    return staked;
   }
 
   /* State-changing functions */
 
   function processPoolBuckets() internal returns (uint staked) {
 
-    // same slot - a single SLOAD
-    staked = currentStake;
-    uint rewardPerSecond = currentRewardPerSecond;
-    uint rewardTime = lastRewardTime;
-    uint poolBucket = lastPoolBucket;
+    uint rewardPerSecond;
+    uint rewardTime;
+    uint poolBucketIndex;
 
-    // get bucket for current time
-    uint currentBucket = block.timestamp / BUCKET_SIZE;
-
-    while (poolBucket < currentBucket) {
-
-      ++poolBucket;
-      uint bucketStartTime = poolBucket * BUCKET_SIZE;
-      staked += (bucketStartTime - rewardTime) * rewardPerSecond;
-
-      rewardTime = bucketStartTime;
-      rewardPerSecond -= poolBuckets[poolBucket].rewardPerSecondCut;
-    }
-
-    staked += (block.timestamp - rewardTime) * rewardPerSecond;
+    (staked, rewardPerSecond, rewardTime, poolBucketIndex) = readPoolBuckets();
 
     // same slot - a single SSTORE
     currentStake = uint96(staked);
     currentRewardPerSecond = uint64(rewardPerSecond);
     lastRewardTime = uint32(rewardTime);
-    lastPoolBucket = uint16(poolBucket);
+    lastPoolBucketIndex = uint16(poolBucketIndex);
   }
 
   /* callable by cover contract */
