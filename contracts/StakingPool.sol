@@ -217,10 +217,38 @@ contract StakingPool is ERC20 {
     _mint(msg.sender, mintAmount);
   }
 
-  function requestUnstake() external {
+  function requestUnstake(uint96 amount) external {
 
-    //
+    Staker memory staker = stakers[msg.sender];
+    uint16 unstakeBucketIndex = uint16(block.timestamp / BUCKET_SIZE + 2);
 
+    // update staker if we're not reusing the unstake request
+    if (staker.lastUnstakeBucketIndex != unstakeBucketIndex) {
+
+      staker.lastUnstakeId += 1;
+      staker.lastUnstakeBucketIndex = unstakeBucketIndex;
+      staker.pendingUnstakeAmount += amount;
+
+      if (staker.firstUnstakeId == 0) {
+        staker.firstUnstakeId = staker.lastUnstakeId;
+      }
+
+      // update staker info
+      stakers[msg.sender] = staker;
+    }
+
+    // upsert unstake request
+    UnstakeRequest storage unstakeRequest = unstakeRequests[msg.sender][staker.lastUnstakeId];
+    unstakeRequest.amount += amount;
+    unstakeRequest.poolBucketIndex = unstakeBucketIndex;
+
+    // update pool bucket
+    poolBuckets[unstakeBucketIndex].unstakeRequested += amount;
+
+    // update totalUnstakeRequested
+    totalUnstakeRequested += amount;
+
+    _transfer(msg.sender, address(this), amount);
   }
 
   function withdraw() external {
