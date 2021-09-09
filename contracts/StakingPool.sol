@@ -9,11 +9,15 @@ contract StakingPool is ERC20 {
   struct PoolBucket {
     // slot 0
     uint64 rewardPerSecondCut;
+    uint96 stakedWhenProcessed;
+    // amount of shares requested for unstake
     uint96 unstakeRequested;
-    uint96 unstaked;
-    // slot 1. find a way to pack this
+    // slot 1
+    // underlying amount unstaked, stored for rate calculation
     uint96 unstakedNXM;
-    // uint160 _unused;
+    // amount of unstaked shares
+    uint96 unstaked;
+    // uint64 _unused;
   }
 
   struct ProductBucket {
@@ -98,12 +102,13 @@ contract StakingPool is ERC20 {
 
   /* View functions */
 
-  function readPoolBuckets() internal view returns (
-    uint staked,
-    uint rewardPerSecond,
-    uint rewardTime,
-    uint poolBucketIndex
-  ) {
+  /* State-changing functions */
+
+  function processPoolBuckets() internal returns (uint staked) {
+
+    uint rewardPerSecond;
+    uint rewardTime;
+    uint poolBucketIndex;
 
     // all vars are in the same slot, uses 1 SLOAD
     staked = currentStake;
@@ -114,6 +119,7 @@ contract StakingPool is ERC20 {
     // get bucket for current time
     uint currentBucketIndex = block.timestamp / BUCKET_SIZE;
 
+    // 1 SLOAD per loop
     while (poolBucketIndex < currentBucketIndex) {
 
       ++poolBucketIndex;
@@ -122,20 +128,10 @@ contract StakingPool is ERC20 {
 
       rewardTime = bucketStartTime;
       rewardPerSecond -= poolBuckets[poolBucketIndex].rewardPerSecondCut;
+      poolBuckets[poolBucketIndex].stakedWhenProcessed = uint96(staked);
     }
 
     staked += (block.timestamp - rewardTime) * rewardPerSecond;
-  }
-
-  /* State-changing functions */
-
-  function processPoolBuckets() internal returns (uint staked) {
-
-    uint rewardPerSecond;
-    uint rewardTime;
-    uint poolBucketIndex;
-
-    (staked, rewardPerSecond, rewardTime, poolBucketIndex) = readPoolBuckets();
 
     // same slot - a single SSTORE
     currentStake = uint96(staked);
@@ -154,7 +150,7 @@ contract StakingPool is ERC20 {
     uint capacityFactor
   ) external {
 
-    uint _currentStake = processPoolBuckets();
+    uint staked = processPoolBuckets();
     uint currentBucket = block.timestamp / BUCKET_SIZE;
 
     Product storage product = products[productId];
@@ -168,6 +164,7 @@ contract StakingPool is ERC20 {
       usedCapacity -= product.buckets[productBucket].capacityExpiring;
     }
 
+    // 1 SLOAD
     uint _currentRewardPerSecond = currentRewardPerSecond;
     uint _reservedStakeRatio = reservedStakeRatio;
 
@@ -175,7 +172,7 @@ contract StakingPool is ERC20 {
       // capacity checks
       // TODO: decide how to calculate reserved capacity
       uint usableRatio = RATIO_PRECISION - _reservedStakeRatio;
-      uint usableStake = _currentStake * usableRatio / RATIO_PRECISION * weight / RATIO_PRECISION;
+      uint usableStake = staked * usableRatio / RATIO_PRECISION * weight / RATIO_PRECISION;
       uint totalCapacity = usableStake * capacityFactor / RATIO_PRECISION;
 
       require(totalCapacity > usedCapacity, "StakingPool: No available capacity");
@@ -251,9 +248,39 @@ contract StakingPool is ERC20 {
     _transfer(msg.sender, address(this), amount);
   }
 
+  function getMaxUsedCapacity() internal view returns (uint) {
+
+    uint[] memory productIds = poolProductsIds;
+    uint productCount = productIds.length;
+    uint currentBucket = block.timestamp / BUCKET_SIZE;
+    uint maxCapacity;
+
+    // O(n*m) in the worst case scenario
+    // O(n) in the best case
+    for (uint i = 0; i < productCount; i++) {
+
+      Product storage product = products[productIds[i]];
+      uint lastBucket = product.lastBucket;
+      uint usedCapacity = product.usedCapacity;
+
+      while (lastBucket < currentBucket) {
+        ++lastBucket;
+        usedCapacity -= product.buckets[lastBucket].capacityExpiring;
+      }
+
+      maxCapacity = maxCapacity < usedCapacity ? usedCapacity : maxCapacity;
+
+      // todo: optionally we could store the result as well
+      // product.lastBucket = uint16(lastBucket);
+      // product.usedCapacity = uint96(usedCapacity);
+    }
+
+    return maxCapacity;
+  }
+
   function withdraw() external {
 
-    //
+    // uint lastUnstakeBucket = lastUnstakeBucketIndex;
 
   }
 
