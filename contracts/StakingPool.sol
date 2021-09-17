@@ -9,7 +9,7 @@ contract StakingPool is ERC20 {
   struct PoolBucket {
     // slot 0
     uint64 rewardPerSecondCut;
-    uint96 stakedWhenProcessed;
+    uint96 stakedWhenProcessed;  // what's this for?
     // amount of shares requested for unstake
     uint96 unstakeRequested;
     // slot 1
@@ -18,15 +18,20 @@ contract StakingPool is ERC20 {
     // amount of unstaked shares
     uint96 unstaked;
     // uint64 _unused;
+    // slot 3
+    uint96 totalCapacityExpiring;
   }
 
   struct ProductBucket {
-    uint96 capacityExpiring;
-    // uint160 _unused;
+    uint96 coverAmountExpiring;
+    // expiring capacity for the last 5 buckets
+    // but only if this is the checkpoint bucket
+    uint96 checkpointCapacityExpiring;
+    // uint64 _unused;
   }
 
   struct Product {
-    uint96 usedCapacity;
+    uint96 activeCoverAmount;
     uint16 weight;
     uint16 lastBucket;
     // uint128 _unused;
@@ -76,28 +81,36 @@ contract StakingPool is ERC20 {
   uint32 public lastRewardTime;
   uint16 public lastPoolBucketIndex;
   uint16 public lastUnstakeBucketIndex;
-  uint16 public reservedStakeRatio;
-  uint16 public _unused_01;
+  uint16 public currentMaxProductWeight;
+  uint16 public maxTotalWeight; // max leverage
 
   /* slot 6 */
   uint96 public totalUnstakeRequested;
+  uint96 public totalActiveCoverAmount;
 
   /* immutables */
   ERC20 public immutable nxm;
+  address public immutable coverContract;
 
   /* constants */
   uint public constant TOKEN_PRECISION = 1e18;
+  uint public constant PARAM_PRECISION = 10_000;
   uint public constant BUCKET_SIZE = 7 days;
-  uint public constant RATIO_PRECISION = 10_000;
 
-  constructor (
-    address _nxm,
-    string memory _name,
-    string memory _symbol
-  ) ERC20(_name, _symbol) {
+  modifier onlyCoverContract {
+    require(msg.sender == coverContract, "StakingPool: Caller is not the cover contract");
+    _;
+  }
+
+  constructor (address _nxm) ERC20("Staked NXM", "SNXM") {
+    nxm = ERC20(_nxm);
+    coverContract = msg.sender;
+  }
+
+  function initialize() external onlyCoverContract {
+    require(lastPoolBucketIndex == 0, "Staking Pool: Already initialized");
     lastPoolBucketIndex = uint16(block.timestamp / BUCKET_SIZE);
     lastUnstakeBucketIndex = uint16(block.timestamp / BUCKET_SIZE);
-    nxm = ERC20(_nxm);
   }
 
   /* View functions */
@@ -131,6 +144,8 @@ contract StakingPool is ERC20 {
       poolBuckets[poolBucketIndex].stakedWhenProcessed = uint96(staked);
     }
 
+    // TODO: process unstakes (here?)
+
     staked += (block.timestamp - rewardTime) * rewardPerSecond;
 
     // same slot - a single SSTORE
@@ -144,7 +159,7 @@ contract StakingPool is ERC20 {
 
   function buyCover(
     uint productId,
-    uint coveredAmount,
+    uint coverAmount,
     uint rewardAmount,
     uint period,
     uint capacityFactor
@@ -155,43 +170,35 @@ contract StakingPool is ERC20 {
 
     Product storage product = products[productId];
     uint weight = product.weight;
-    uint usedCapacity = product.usedCapacity;
-    uint productBucket = product.lastBucket;
+    uint activeCoverAmount = product.activeCoverAmount;
+    uint lastBucket = product.lastBucket;
 
     // process expirations
-    while (productBucket < currentBucket) {
-      ++productBucket;
-      usedCapacity -= product.buckets[productBucket].capacityExpiring;
+    while (lastBucket < currentBucket) {
+      ++lastBucket;
+      activeCoverAmount -= product.buckets[lastBucket].coverAmountExpiring;
     }
-
-    // 1 SLOAD
-    uint _currentRewardPerSecond = currentRewardPerSecond;
-    uint _reservedStakeRatio = reservedStakeRatio;
 
     {
       // capacity checks
-      // TODO: decide how to calculate reserved capacity
-      uint usableRatio = RATIO_PRECISION - _reservedStakeRatio;
-      uint usableStake = staked * usableRatio / RATIO_PRECISION * weight / RATIO_PRECISION;
-      uint totalCapacity = usableStake * capacityFactor / RATIO_PRECISION;
-
-      require(totalCapacity > usedCapacity, "StakingPool: No available capacity");
-      require(totalCapacity - usedCapacity >= coveredAmount, "StakingPool: No available capacity");
+      uint maxActiveCoverAmount = staked * capacityFactor * weight / PARAM_PRECISION / PARAM_PRECISION;
+      require(activeCoverAmount + coverAmount <= maxActiveCoverAmount, "StakingPool: No available capacity");
     }
 
     {
       // calculate expiration bucket, reward period, reward amount
-      uint expirationBucket = (block.timestamp + period * 1 days) / BUCKET_SIZE + 1;
+      uint expirationBucket = (block.timestamp + period) / BUCKET_SIZE + 1;
       uint rewardPeriod = expirationBucket * BUCKET_SIZE - block.timestamp;
       uint addedRewardPerSecond = rewardAmount / rewardPeriod;
 
       // update state
-      currentRewardPerSecond = uint64(_currentRewardPerSecond + addedRewardPerSecond);
+      // 1 SLOAD + 3 SSTORE
+      currentRewardPerSecond = uint64(currentRewardPerSecond + addedRewardPerSecond);
       poolBuckets[expirationBucket].rewardPerSecondCut += uint64(addedRewardPerSecond);
-      product.buckets[expirationBucket].capacityExpiring += uint96(coveredAmount);
+      product.buckets[expirationBucket].coverAmountExpiring += uint96(coverAmount);
 
-      product.lastBucket = uint16(productBucket);
-      product.usedCapacity = uint96(usedCapacity + coveredAmount);
+      product.lastBucket = uint16(lastBucket);
+      product.activeCoverAmount = uint96(activeCoverAmount + coverAmount);
     }
   }
 
@@ -246,36 +253,6 @@ contract StakingPool is ERC20 {
     totalUnstakeRequested += amount;
 
     _transfer(msg.sender, address(this), amount);
-  }
-
-  function getMaxUsedCapacity() internal view returns (uint) {
-
-    uint[] memory productIds = poolProductsIds;
-    uint productCount = productIds.length;
-    uint currentBucket = block.timestamp / BUCKET_SIZE;
-    uint maxCapacity;
-
-    // O(n*m) in the worst case scenario
-    // O(n) in the best case
-    for (uint i = 0; i < productCount; i++) {
-
-      Product storage product = products[productIds[i]];
-      uint lastBucket = product.lastBucket;
-      uint usedCapacity = product.usedCapacity;
-
-      while (lastBucket < currentBucket) {
-        ++lastBucket;
-        usedCapacity -= product.buckets[lastBucket].capacityExpiring;
-      }
-
-      maxCapacity = maxCapacity < usedCapacity ? usedCapacity : maxCapacity;
-
-      // todo: optionally we could store the result as well
-      // product.lastBucket = uint16(lastBucket);
-      // product.usedCapacity = uint96(usedCapacity);
-    }
-
-    return maxCapacity;
   }
 
   function withdraw() external {
