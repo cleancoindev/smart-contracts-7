@@ -9,17 +9,14 @@ contract StakingPool is ERC20 {
   struct PoolBucket {
     // slot 0
     uint64 rewardPerSecondCut;
-    uint96 stakedWhenProcessed;  // what's this for?
     // amount of shares requested for unstake
     uint96 unstakeRequested;
+    // amount of unstaked shares
+    uint96 unstaked;
+
     // slot 1
     // underlying amount unstaked, stored for rate calculation
     uint96 unstakedNXM;
-    // amount of unstaked shares
-    uint96 unstaked;
-    // uint64 _unused;
-    // slot 3
-    uint96 totalCapacityExpiring;
   }
 
   struct ProductBucket {
@@ -60,7 +57,7 @@ contract StakingPool is ERC20 {
 
   /* slot 1 */
   // staker address => staker unstake info
-  // todo: unstakes make take a looooong time, consider issuing an nft that represents staker's requests
+  // todo: unstakes may take a looooong time, consider issuing an nft that represents staker's requests
   mapping(address => Staker) public stakers;
 
   /* slot 2 */
@@ -81,12 +78,21 @@ contract StakingPool is ERC20 {
   uint32 public lastRewardTime;
   uint16 public lastPoolBucketIndex;
   uint16 public lastUnstakeBucketIndex;
-  uint16 public currentMaxProductWeight;
-  uint16 public maxTotalWeight; // max leverage
+  uint16 public totalWeight;
+  uint16 public maxTotalWeight;
 
   /* slot 6 */
-  uint96 public totalUnstakeRequested;
-  uint96 public totalActiveCoverAmount;
+  //// total actually requested
+  //uint96 public totalUnstakeRequested;
+  // requested at bucket t-2
+  uint96 public totalUnstakeAllowed;
+  // unstaked but not withdrawn
+  uint96 public totalUnstaked;
+
+  // used for max unstake
+  // max unstake = min(stake - maxCapacity, stake - totalLeverage)
+  uint96 public maxCapacity;
+  uint96 public totalLeverage;
 
   /* immutables */
   ERC20 public immutable nxm;
@@ -102,9 +108,9 @@ contract StakingPool is ERC20 {
     _;
   }
 
-  constructor (address _nxm) ERC20("Staked NXM", "SNXM") {
+  constructor (address _nxm, address _coverContract) ERC20("Staked NXM", "SNXM") {
     nxm = ERC20(_nxm);
-    coverContract = msg.sender;
+    coverContract = _coverContract;
   }
 
   function initialize() external onlyCoverContract {
@@ -115,44 +121,104 @@ contract StakingPool is ERC20 {
 
   /* View functions */
 
+  function min(uint a, uint b) internal pure returns (uint) {
+    return a < b ? a : b;
+  }
+
+  function max(uint a, uint b) internal pure returns (uint) {
+    return a > b ? a : b;
+  }
+
   /* State-changing functions */
 
   function processPoolBuckets() internal returns (uint staked) {
 
-    uint rewardPerSecond;
-    uint rewardTime;
-    uint poolBucketIndex;
-
-    // all vars are in the same slot, uses 1 SLOAD
+    // 1 SLOAD
     staked = currentStake;
-    rewardPerSecond = currentRewardPerSecond;
-    rewardTime = lastRewardTime;
-    poolBucketIndex = lastPoolBucketIndex;
+    uint rewardPerSecond = currentRewardPerSecond;
+    uint rewardTime = lastRewardTime;
+    uint poolBucketIndex = lastPoolBucketIndex;
+    uint unstakeBucketIndex = lastUnstakeBucketIndex;
+
+    // 1 SLOAD
+    uint _totalUnstakeAllowed = totalUnstakeAllowed;
+    // TODO: do we need this one?
+    uint _totalUnstaked = totalUnstaked;
+
+    // 1 SLOAD
+    uint supply = totalSupply();
 
     // get bucket for current time
     uint currentBucketIndex = block.timestamp / BUCKET_SIZE;
+    uint maxUnstake;
 
-    // 1 SLOAD per loop
+    {
+      // 1 SLOAD
+      uint maxUsage = max(maxCapacity, totalLeverage);
+      maxUnstake = staked > maxUsage ? staked - maxUsage : 0;
+    }
+
+    // process expirations
     while (poolBucketIndex < currentBucketIndex) {
 
       ++poolBucketIndex;
       uint bucketStartTime = poolBucketIndex * BUCKET_SIZE;
       staked += (bucketStartTime - rewardTime) * rewardPerSecond;
-
       rewardTime = bucketStartTime;
+
+      // 1 SLOAD for both
       rewardPerSecond -= poolBuckets[poolBucketIndex].rewardPerSecondCut;
-      poolBuckets[poolBucketIndex].stakedWhenProcessed = uint96(staked);
+      _totalUnstakeAllowed += poolBuckets[poolBucketIndex].unstakeRequested;
+
+      // process unstakes
+      while (maxUnstake > 0 && _totalUnstakeAllowed > 0 && unstakeBucketIndex <= poolBucketIndex) {
+
+        // 1 SLOAD
+        uint requested = poolBuckets[unstakeBucketIndex].unstakeRequested;
+        uint unstakedPreviously = poolBuckets[unstakeBucketIndex].unstaked;
+
+        if (requested == unstakedPreviously) {
+          // all freed up or none requested
+          ++unstakeBucketIndex;
+          continue;
+        }
+
+        uint unstakedNow;
+        {
+          uint unstakePending = requested - unstakedPreviously;
+          uint canUnstake = min(maxUnstake, _totalUnstakeAllowed);
+          unstakedNow = min(canUnstake, unstakePending);
+        }
+
+        uint unstakedNXM = unstakedNow * staked / supply;
+        _totalUnstakeAllowed -= unstakedNow;
+        maxUnstake -= unstakedNow;
+        staked -= unstakedNXM;
+        supply -= unstakedNow;
+
+        // 1 SSTORE
+        poolBuckets[unstakeBucketIndex].unstaked = uint96(unstakedPreviously + unstakedNow);
+        // 1 SLOAD + 1 SSTORE
+        poolBuckets[unstakeBucketIndex].unstakedNXM += uint96(unstakedNXM);
+
+        // move on
+        ++unstakeBucketIndex;
+      }
     }
 
-    // TODO: process unstakes (here?)
-
+    // if we're mid-bucket, process rewards until current timestamp
     staked += (block.timestamp - rewardTime) * rewardPerSecond;
 
-    // same slot - a single SSTORE
+    // 1 SSTORE
     currentStake = uint96(staked);
     currentRewardPerSecond = uint64(rewardPerSecond);
-    lastRewardTime = uint32(rewardTime);
+    lastRewardTime = uint32(block.timestamp);
     lastPoolBucketIndex = uint16(poolBucketIndex);
+    lastUnstakeBucketIndex = uint16(unstakeBucketIndex);
+
+    // 1 SSTORE
+    totalUnstakeAllowed = uint96(_totalUnstakeAllowed);
+    totalUnstaked = uint96(_totalUnstaked);
   }
 
   /* callable by cover contract */
@@ -248,9 +314,6 @@ contract StakingPool is ERC20 {
 
     // update pool bucket
     poolBuckets[unstakeBucketIndex].unstakeRequested += amount;
-
-    // update totalUnstakeRequested
-    totalUnstakeRequested += amount;
 
     _transfer(msg.sender, address(this), amount);
   }
